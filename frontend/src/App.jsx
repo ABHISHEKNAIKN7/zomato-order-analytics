@@ -40,7 +40,7 @@ import {
 
 import "./styles.css";
 
-const API = "http://localhost:5000/api";
+const API = "https://zomato-order-api-4tvs.onrender.com/api";
 const PAGE_SIZE = 10;
 
 // =====================================================
