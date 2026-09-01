@@ -2,16 +2,12 @@
 // DATA IMPORT SCRIPT
 // =====================================================
 // Purpose:
-// Import the cleaned and merged CSV file into PostgreSQL.
+// Import the cleaned Zomato order CSV into PostgreSQL.
 //
-// This script performs 3 main imports:
-// 1. Restaurants
-// 2. Customers
-// 3. Orders
-//
-// It uses a database transaction so that if something
-// goes wrong during the import, the changes can be
-// rolled back.
+// This version is optimized for Neon PostgreSQL.
+// Instead of sending thousands of individual queries,
+// it sends records in batches to make the import faster
+// and more reliable.
 // =====================================================
 
 require("dotenv").config();
@@ -24,11 +20,8 @@ const { Pool } = require("pg");
 // =====================================================
 // DATABASE CONNECTION
 // =====================================================
-// Creates a connection pool to PostgreSQL.
-//
-// The database details are taken from the .env file.
-// This keeps sensitive information such as the password
-// outside the JavaScript source code.
+// Neon PostgreSQL requires an SSL connection.
+// The connection values come from backend/.env.
 // =====================================================
 
 const pool = new Pool({
@@ -36,20 +29,16 @@ const pool = new Pool({
   host: process.env.DB_HOST,
   database: process.env.DB_NAME,
   password: process.env.DB_PASSWORD,
-  port: Number(process.env.DB_PORT)
+  port: Number(process.env.DB_PORT),
+  ssl: {
+    rejectUnauthorized: false,
+  },
 });
 
 // =====================================================
 // CSV FILE LOCATION
 // =====================================================
-// Points to the cleaned merged CSV file.
-//
-// __dirname = current backend folder
-// ".."      = move one folder up
-// "data"    = data folder
-//
-// Final file:
-// data/merged_orders_cleaned.csv
+// The CSV is stored in the project's data folder.
 // =====================================================
 
 const file = path.join(
@@ -60,240 +49,282 @@ const file = path.join(
 );
 
 // =====================================================
-// STORE CSV ROWS
-// =====================================================
-// Every row from the CSV will be stored in this array
-// before it is inserted into PostgreSQL.
+// READ CSV DATA
 // =====================================================
 
 const rows = [];
 
-// =====================================================
-// READ CSV FILE
-// =====================================================
-// createReadStream() reads the CSV file.
-//
-// csv-parser converts each CSV row into a JavaScript
-// object.
-//
-// Example:
-// {
-//   restaurant: "...",
-//   customer_id: "...",
-//   order_id: "..."
-// }
-//
-// Each row is pushed into the rows array.
-// =====================================================
+console.log("Reading CSV file...");
 
 fs.createReadStream(file)
   .pipe(csv())
-  .on("data", (r) => rows.push(r))
-
-  // ===================================================
-  // CSV READING COMPLETED
-  // ===================================================
-  // Once the entire CSV has been read, connect to the
-  // PostgreSQL database and start the import process.
-  // ===================================================
-
+  .on("data", (row) => {
+    rows.push(row);
+  })
   .on("end", async () => {
+    console.log(`CSV loaded successfully: ${rows.length} rows`);
 
     const client = await pool.connect();
 
     try {
-
       // =================================================
       // START DATABASE TRANSACTION
-      // =================================================
-      // All database operations below happen inside one
-      // transaction.
-      //
-      // If everything succeeds:
-      // COMMIT
-      //
-      // If an error happens:
-      // ROLLBACK
-      //
-      // This prevents partially imported data.
       // =================================================
 
       await client.query("BEGIN");
 
       // =================================================
-      // IMPORT RESTAURANTS
+      // STEP 1 — INSERT RESTAURANTS
       // =================================================
-      // The CSV may contain the same restaurant many
-      // times because every order has a restaurant.
-      //
-      // We use a Map to make sure each restaurant is
-      // processed only once during this import.
-      //
-      // The PostgreSQL restaurant_id generated for each
-      // restaurant is stored in the Map.
+      // Create a unique list of restaurants first.
       // =================================================
 
-      const restaurants = new Map();
+      const restaurantMap = new Map();
 
-      for (const r of rows) {
-
-        // -----------------------------------------------
-        // Find the restaurant name from the CSV.
-        //
-        // Different possible column names are supported.
-        // -----------------------------------------------
-
+      for (const row of rows) {
         const name =
-          r.restaurant ||
-          r.restaurant_name ||
-          r.restaurant_id;
+          row.restaurant ||
+          row.restaurant_name ||
+          row.restaurant_id;
 
-        // -----------------------------------------------
-        // Only insert the restaurant if it hasn't already
-        // been processed.
-        // -----------------------------------------------
+        if (!name) {
+          continue;
+        }
 
-        if (!restaurants.has(name)) {
-
-          const q = await client.query(
-            `INSERT INTO restaurants(
-              restaurant_name,
-              subzone,
-              city
-            )
-             VALUES($1,$2,$3)
-
-             ON CONFLICT(restaurant_name)
-             DO UPDATE SET
-               restaurant_name=EXCLUDED.restaurant_name
-
-             RETURNING restaurant_id`,
-
-            [
-              name,
-              r.subzone || null,
-              r.city || null
-            ]
-          );
-
-          // ---------------------------------------------
-          // Store the generated PostgreSQL restaurant ID.
-          //
-          // Example:
-          // "Restaurant A" -> 1
-          // "Restaurant B" -> 2
-          // ---------------------------------------------
-
-          restaurants.set(
+        if (!restaurantMap.has(name)) {
+          restaurantMap.set(name, {
             name,
-            q.rows[0].restaurant_id
+            subzone: row.subzone || null,
+            city: row.city || null,
+          });
+        }
+      }
+
+      const restaurants = Array.from(restaurantMap.values());
+
+      console.log(`Importing ${restaurants.length} restaurants...`);
+
+      if (restaurants.length > 0) {
+        const values = [];
+        const placeholders = [];
+
+        restaurants.forEach((restaurant, index) => {
+          const base = index * 3;
+
+          placeholders.push(
+            `($${base + 1}, $${base + 2}, $${base + 3})`
           );
+
+          values.push(
+            restaurant.name,
+            restaurant.subzone,
+            restaurant.city
+          );
+        });
+
+        const restaurantQuery = `
+          INSERT INTO restaurants (
+            restaurant_name,
+            subzone,
+            city
+          )
+          VALUES ${placeholders.join(",")}
+          ON CONFLICT (restaurant_name)
+          DO UPDATE SET
+            restaurant_name = EXCLUDED.restaurant_name
+          RETURNING restaurant_id, restaurant_name
+        `;
+
+        const result = await client.query(
+          restaurantQuery,
+          values
+        );
+
+        // Build restaurant name → database ID map.
+        for (const restaurant of result.rows) {
+          restaurantMap.get(restaurant.restaurant_name).restaurant_id =
+            restaurant.restaurant_id;
         }
       }
 
       // =================================================
-      // IMPORT CUSTOMERS
+      // STEP 2 — INSERT CUSTOMERS
       // =================================================
-      // Customers are inserted into the customers table.
-      //
-      // customer_id is unique, so duplicate customers
-      // are ignored.
+      // Customers are inserted in one batch.
       // =================================================
 
-      for (const r of rows) {
+      const customerMap = new Map();
 
-        // -----------------------------------------------
-        // Only insert a customer when customer_id exists.
-        // -----------------------------------------------
+      for (const row of rows) {
+        if (!row.customer_id) {
+          continue;
+        }
 
-        if (r.customer_id) {
-
-          await client.query(
-            `INSERT INTO customers(
-              customer_id,
-              customer_phone
-            )
-             VALUES($1,$2)
-
-             ON CONFLICT(customer_id)
-             DO NOTHING`,
-
-            [
-              r.customer_id,
-              r.customer_phone || null
-            ]
-          );
+        if (!customerMap.has(row.customer_id)) {
+          customerMap.set(row.customer_id, {
+            customer_id: row.customer_id,
+            customer_phone: row.customer_phone || null,
+          });
         }
       }
 
-      // =================================================
-      // IMPORT ORDERS
-      // =================================================
-      // This is the main data import.
-      //
-      // Every CSV row represents an order.
-      //
-      // The order is connected to:
-      // - Restaurant
-      // - Customer
-      //
-      // Other information such as:
-      // - Amount
-      // - Status
-      // - Rating
-      // - Delivery
-      // - Distance
-      // - Charges
-      // - Complaints
-      // - Cancellation reason
-      // etc.
-      //
-      // is also stored here.
-      // =================================================
+      const customers = Array.from(customerMap.values());
 
-      for (const r of rows) {
+      console.log(`Importing ${customers.length} customers...`);
 
-        // -----------------------------------------------
-        // Find the restaurant name.
-        // -----------------------------------------------
+      const CUSTOMER_BATCH_SIZE = 1000;
 
-        const name =
-          r.restaurant ||
-          r.restaurant_name ||
-          r.restaurant_id;
+      for (
+        let start = 0;
+        start < customers.length;
+        start += CUSTOMER_BATCH_SIZE
+      ) {
+        const batch = customers.slice(
+          start,
+          start + CUSTOMER_BATCH_SIZE
+        );
 
-        // -----------------------------------------------
-        // Find the order ID.
-        // -----------------------------------------------
+        const values = [];
+        const placeholders = [];
 
-        const orderId =
-          r.order_id ||
-          r.orderid;
+        batch.forEach((customer, index) => {
+          const base = index * 2;
 
-        // -----------------------------------------------
-        // Find the order date/time.
-        //
-        // parsed_order_placed_at is preferred when
-        // available.
-        // -----------------------------------------------
+          placeholders.push(
+            `($${base + 1}, $${base + 2})`
+          );
 
-        const placed =
-          r.parsed_order_placed_at ||
-          r.order_placed_at ||
-          null;
-
-        // -----------------------------------------------
-        // Insert the order into PostgreSQL.
-        //
-        // $1, $2, $3 ... are PostgreSQL parameter
-        // placeholders.
-        //
-        // Using parameters prevents values from being
-        // directly inserted into the SQL query.
-        // -----------------------------------------------
+          values.push(
+            customer.customer_id,
+            customer.customer_phone
+          );
+        });
 
         await client.query(
-          `INSERT INTO orders(
+          `
+          INSERT INTO customers (
+            customer_id,
+            customer_phone
+          )
+          VALUES ${placeholders.join(",")}
+          ON CONFLICT (customer_id)
+          DO NOTHING
+          `,
+          values
+        );
+
+        console.log(
+          `Customers imported: ${Math.min(
+            start + CUSTOMER_BATCH_SIZE,
+            customers.length
+          )}/${customers.length}`
+        );
+      }
+
+      // =================================================
+      // STEP 3 — INSERT ORDERS
+      // =================================================
+      // Orders are inserted in batches.
+      // This avoids thousands of individual queries.
+      // =================================================
+
+      console.log(`Importing ${rows.length} orders...`);
+
+      const ORDER_BATCH_SIZE = 500;
+
+      for (
+        let start = 0;
+        start < rows.length;
+        start += ORDER_BATCH_SIZE
+      ) {
+        const batch = rows.slice(
+          start,
+          start + ORDER_BATCH_SIZE
+        );
+
+        const values = [];
+        const placeholders = [];
+
+        batch.forEach((row, index) => {
+          const base = index * 24;
+
+          const restaurantName =
+            row.restaurant ||
+            row.restaurant_name ||
+            row.restaurant_id;
+
+          const restaurant =
+            restaurantMap.get(restaurantName);
+
+          const orderId =
+            row.order_id ||
+            row.orderid;
+
+          const placed =
+            row.parsed_order_placed_at ||
+            row.order_placed_at ||
+            null;
+
+          placeholders.push(`
+            (
+              $${base + 1},
+              $${base + 2},
+              $${base + 3},
+              $${base + 4},
+              $${base + 5},
+              $${base + 6},
+              $${base + 7},
+              $${base + 8},
+              $${base + 9},
+              $${base + 10},
+              $${base + 11},
+              $${base + 12},
+              $${base + 13},
+              $${base + 14},
+              $${base + 15},
+              $${base + 16},
+              $${base + 17},
+              $${base + 18},
+              $${base + 19},
+              $${base + 20},
+              $${base + 21},
+              $${base + 22},
+              $${base + 23},
+              $${base + 24}
+            )
+          `);
+
+          values.push(
+            orderId,
+            restaurant ? restaurant.restaurant_id : null,
+            row.customer_id || null,
+            row.subzone || null,
+            row.city || null,
+            placed,
+            row.order_status || null,
+            row.delivery_type || null,
+            row.distance_km || null,
+            row.items_in_order || null,
+            row.instructions || null,
+            row.bill_subtotal || null,
+            row.packaging_charges || null,
+            row.total || null,
+            row.rating || null,
+            row.review || null,
+            row.cancellation_reason || null,
+            row.restaurant_compensation || null,
+            row.restaurant_penalty || null,
+            row.kpt_duration || null,
+            row.rider_wait_time || null,
+            row.order_ready_marked || null,
+            row.customer_complaint_tag || null,
+            row.customer_phone || null
+          );
+        });
+
+        await client.query(
+          `
+          INSERT INTO orders (
             order_id,
             restaurant_id,
             customer_id,
@@ -319,148 +350,58 @@ fs.createReadStream(file)
             customer_complaint_tag,
             customer_phone
           )
+          VALUES ${placeholders.join(",")}
+          ON CONFLICT (order_id)
+          DO NOTHING
+          `,
+          values
+        );
 
-           VALUES(
-            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
-            $11,$12,$13,$14,$15,$16,$17,$18,
-            $19,$20,$21,$22,$23,$24
-           )
-
-           ON CONFLICT(order_id)
-           DO NOTHING`,
-
-          [
-            // -------------------------------------------
-            // Order identification
-            // -------------------------------------------
-
-            orderId,
-
-            // -------------------------------------------
-            // Restaurant ID obtained from the Map above.
-            // -------------------------------------------
-
-            restaurants.get(name),
-
-            // -------------------------------------------
-            // Customer information
-            // -------------------------------------------
-
-            r.customer_id || null,
-
-            // -------------------------------------------
-            // Location information
-            // -------------------------------------------
-
-            r.subzone || null,
-            r.city || null,
-
-            // -------------------------------------------
-            // Order date/time
-            // -------------------------------------------
-
-            placed,
-
-            // -------------------------------------------
-            // Order status and delivery information
-            // -------------------------------------------
-
-            r.order_status || null,
-            r.delivery_type || null,
-
-            // -------------------------------------------
-            // Order distance and items
-            // -------------------------------------------
-
-            r.distance_km || null,
-            r.items_in_order || null,
-            r.instructions || null,
-
-            // -------------------------------------------
-            // Billing information
-            // -------------------------------------------
-
-            r.bill_subtotal || null,
-            r.packaging_charges || null,
-            r.total || null,
-
-            // -------------------------------------------
-            // Rating and review
-            // -------------------------------------------
-
-            r.rating || null,
-            r.review || null,
-
-            // -------------------------------------------
-            // Cancellation and restaurant compensation
-            // -------------------------------------------
-
-            r.cancellation_reason || null,
-            r.restaurant_compensation || null,
-            r.restaurant_penalty || null,
-
-            // -------------------------------------------
-            // Operational performance data
-            // -------------------------------------------
-
-            r.kpt_duration || null,
-            r.rider_wait_time || null,
-            r.order_ready_marked || null,
-
-            // -------------------------------------------
-            // Customer complaint information
-            // -------------------------------------------
-
-            r.customer_complaint_tag || null,
-
-            // -------------------------------------------
-            // Customer phone
-            // -------------------------------------------
-
-            r.customer_phone || null
-          ]
+        console.log(
+          `Orders imported: ${Math.min(
+            start + ORDER_BATCH_SIZE,
+            rows.length
+          )}/${rows.length}`
         );
       }
 
       // =================================================
       // COMMIT TRANSACTION
       // =================================================
-      // If all restaurant, customer and order inserts
-      // completed successfully, permanently save the
-      // changes to PostgreSQL.
-      // =================================================
 
       await client.query("COMMIT");
 
+      console.log("");
+      console.log("==============================================");
+      console.log("IMPORT COMPLETED SUCCESSFULLY");
+      console.log("==============================================");
+      console.log(`Rows read from CSV: ${rows.length}`);
+      console.log(`Restaurants: ${restaurants.length}`);
+      console.log(`Customers: ${customers.length}`);
+      console.log(`Orders: ${rows.length}`);
+      console.log("==============================================");
+    } catch (error) {
       // =================================================
-      // IMPORT SUCCESS MESSAGE
-      // =================================================
-
-      console.log(`Imported ${rows.length} rows.`);
-
-    } catch (e) {
-
-      // =================================================
-      // ROLLBACK
-      // =================================================
-      // If any error happens during the import, undo all
-      // database changes made during this transaction.
+      // ROLLBACK IF ANYTHING FAILS
       // =================================================
 
       await client.query("ROLLBACK");
 
-      console.error(e);
-
+      console.error("");
+      console.error("==============================================");
+      console.error("IMPORT FAILED");
+      console.error("==============================================");
+      console.error(error);
+      console.error("==============================================");
     } finally {
-
       // =================================================
-      // CLEANUP
-      // =================================================
-      // Release the database client and close the pool.
+      // CLOSE DATABASE CONNECTION
       // =================================================
 
       client.release();
-
       await pool.end();
     }
+  })
+  .on("error", (error) => {
+    console.error("Error reading CSV file:", error);
   });

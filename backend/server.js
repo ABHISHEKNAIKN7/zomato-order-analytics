@@ -29,6 +29,9 @@ const pool = new Pool({
   database: process.env.DB_NAME,
   password: process.env.DB_PASSWORD,
   port: Number(process.env.DB_PORT),
+  ssl: {
+    rejectUnauthorized: false,
+  },
 });
 
 
@@ -1577,13 +1580,17 @@ const PORT =
   process.env.PORT || 5000;
 
 
-app.listen(
-  PORT,
-  () => {
+// app.listen(
+//   PORT,
+//   () => {
 
-    console.log(
-      `API running on http://localhost:${PORT}`
-    );
+//     console.log(
+//       `API running on http://localhost:${PORT}`
+//     );
 
-  }
-);
+//   }
+// );
+
+app.listen(PORT, () => {
+  console.log(`API running on port ${PORT}`);
+});
